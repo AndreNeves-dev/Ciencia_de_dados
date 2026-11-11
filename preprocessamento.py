@@ -6,7 +6,9 @@ Brasil, 2007-2023, valores em Mil Reais.
 
 Entrada : CSV da Sprint 1 (136 linhas x 7 colunas)
 Saidas  : dados/base_limpa.csv          -> 119 linhas, sem "Total geral", log aplicado
-          dados/base_modelagem.csv      -> 112 linhas, com defasagens (t-1) e one-hot
+          dados/base_modelagem.csv      -> 105 linhas, com defasagens (t-1), one-hot e
+                                           os alvos cresc (regressao) e tendencia
+                                           (classificacao)
           dados/relatorio_preprocessamento.txt
 
 Uso:
@@ -34,6 +36,8 @@ COLUNAS = {
 COMPONENTES = ["mercadorias", "revendidas", "combustiveis", "outros"]
 MONETARIAS = ["total"] + COMPONENTES
 TOTAL_GERAL = "Total geral"
+LIMITE_ALTA_FORTE = 15  # % de crescimento anual que separa alta moderada de alta forte
+CLASSES = ["queda", "alta_moderada", "alta_forte"]
 PASTA_SAIDA = Path("dados")
 
 log = []
@@ -85,14 +89,16 @@ def checar_qualidade(df: pd.DataFrame) -> pd.DataFrame:
 def checar_consistencia(df: pd.DataFrame) -> None:
     # (a) total = soma dos quatro componentes, linha a linha
     dif = (df["total"] - df[COMPONENTES].sum(axis=1)).abs()
-    linhas_ok = int((dif <= 1).sum())  # tolerancia de 1 mil reais (arredondamento)
+    # tolerancia de 5 mil reais: a tabela do IBGE e arredondada por componente,
+    # e na base real a maior diferenca entre total e soma e de 3 mil reais
+    linhas_ok = int((dif <= 5).sum())
     registrar(f"[3a] Total = soma dos 4 componentes em {linhas_ok}/{len(df)} linhas "
               f"(maior diferenca: {dif.max():,.0f} mil R$)")
 
     # (b) Total geral = soma das 7 atividades, ano a ano
     ativ = df[df["atividade"] != TOTAL_GERAL].groupby("ano")[MONETARIAS].sum()
     tg = df[df["atividade"] == TOTAL_GERAL].set_index("ano")[MONETARIAS]
-    anos_ok = int(((ativ - tg).abs() <= 1).all(axis=1).sum())
+    anos_ok = int(((ativ - tg).abs() <= 5).all(axis=1).sum())
     registrar(f"[3b] Total geral = soma das atividades em {anos_ok}/{len(tg)} anos")
 
 
@@ -150,10 +156,25 @@ def criar_defasagens(df: pd.DataFrame) -> pd.DataFrame:
     for c in MONETARIAS:
         df[f"log_{c}_lag1"] = g[f"log_{c}"].shift(1)
     df["part_combustiveis_lag1"] = g["combustiveis"].shift(1) / g["total"].shift(1)
+
+    # Alvo de regressao: crescimento anual do custo total, em log
+    # cresc_t = log(1+total_t) - log(1+total_t-1)  ~  variacao percentual
+    df["cresc"] = df["log_total"] - df["log_total_lag1"]
+    # Preditor: crescimento do ano anterior (t-2 -> t-1)
+    df["cresc_lag1"] = df.groupby("atividade")["cresc"].shift(1)
+
+    # Alvo de classificacao: tendencia do custo no ano t
+    pct = np.expm1(df["cresc"]) * 100
+    df["tendencia"] = pd.cut(pct, bins=[-np.inf, 0, LIMITE_ALTA_FORTE, np.inf],
+                             labels=CLASSES).astype(object)
+    df.loc[df["cresc"].isna(), "tendencia"] = np.nan
+
     antes = len(df)
-    df = df.dropna(subset=[f"log_total_lag1"]).reset_index(drop=True)
-    registrar(f"[7] Defasagens criadas; primeiro ano de cada atividade removido: "
-              f"{antes} -> {len(df)} linhas")
+    df = df.dropna(subset=["cresc_lag1"]).reset_index(drop=True)
+    registrar(f"[7] Defasagens e alvos criados; dois primeiros anos de cada atividade "
+              f"removidos: {antes} -> {len(df)} linhas")
+    registrar(f"     Classes de tendencia (limites 0% e {LIMITE_ALTA_FORTE}%): "
+              f"{df['tendencia'].value_counts().to_dict()}")
     return df
 
 
@@ -214,13 +235,15 @@ def main(caminho: str) -> None:
 
     preditores = (["ano"]
                   + [f"log_{c}_lag1" for c in MONETARIAS]
-                  + ["part_combustiveis_lag1"]
+                  + ["part_combustiveis_lag1", "cresc_lag1"]
                   + [c for c in df_mod.columns if c.startswith("ativ_")])
-    saida = df_mod[["ano", "atividade"] + preditores[1:] + ["log_total", "total"]]
+    saida = df_mod[["ano", "atividade"] + preditores[1:]
+                   + ["cresc", "tendencia", "log_total", "total"]]
     saida.to_csv(PASTA_SAIDA / "base_modelagem.csv", index=False)
 
     registrar(f"[10] Base de modelagem: {saida.shape[0]} linhas | "
-              f"{len(preditores)} preditores | alvo = log_total")
+              f"{len(preditores)} preditores | alvos = cresc (regressao) "
+              f"e tendencia (classificacao)")
     registrar("     Padronizacao (z-score) NAO aplicada aqui: sera ajustada so no "
               "conjunto de treino, dentro do Pipeline da Sprint 3, para evitar vazamento.")
 
